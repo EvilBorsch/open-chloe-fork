@@ -1,0 +1,1393 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STACK_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+# Persistent volume root (e.g. /mnt/volume-hel1-2); set by setup step 1 or .openclaw-volume-root
+VOLUME_ROOT_FILE="$STACK_DIR/.openclaw-volume-root"
+if [ -f "$VOLUME_ROOT_FILE" ] && [ -s "$VOLUME_ROOT_FILE" ]; then
+  OPENCLAW_VOLUME_ROOT=$(cat "$VOLUME_ROOT_FILE" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' | head -1)
+fi
+ENV_FILE=${ENV_FILE:-/etc/openclaw/stack.env}
+# Load INSTANCE from env file so we check the same container names as docker compose
+if [ -f "$ENV_FILE" ]; then
+  INSTANCE=$(grep -E '^INSTANCE=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | head -1)
+fi
+INSTANCE=${INSTANCE:-op-and-chloe}
+
+TIGER="🐯"
+OK="✅"
+WARN="⚠️"
+
+say(){ echo "$TIGER $*"; }
+ok(){ echo "$OK $*"; }
+warn(){ echo "$WARN $*"; }
+sep(){ echo "────────────────────────────────────────────────────────"; }
+
+guard_name="${INSTANCE}-openclaw-guard"
+worker_name="${INSTANCE}-openclaw-gateway"
+browser_name="${INSTANCE}-browser"
+worker_cfg="/var/lib/openclaw/chloe/state/openclaw.json"
+guard_cfg="/var/lib/openclaw/guard/state/openclaw.json"
+
+welcome(){
+  echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+  echo "┃ 🐯 OpenClaw Setup Wizard                                   ┃"
+  echo "┃ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ┃"
+  echo "┃ Setup includes:                                            ┃"
+  echo "┃   🖥️ Webtop browser (Chromium) for persistent logins        ┃"
+  echo "┃   🐕 Op (guard) — admin with SSH access                    ┃"
+  echo "┃   🐯 Chloe (worker) — day-to-day, create all agents here   ┃"
+  echo "┃   🔐 Tailscale for private network access                  ┃"
+  echo "┃   🔑 Bitwarden (passwordless: no secrets in files)         ┃"
+  echo "┃   ❤️ Healthcheck + watchdog validation                      ┃"
+  echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+}
+
+need_root(){
+  if [ "$EUID" -ne 0 ]; then
+    warn "Please run with sudo: sudo ./setup.sh"
+    exit 1
+  fi
+}
+
+container_running(){
+  local name="$1"
+  command -v docker >/dev/null 2>&1 || return 1
+  # Match exact name or Compose-prefixed name (e.g. project_op-and-chloe-openclaw-guard)
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${name}$|_${name}$"
+}
+
+# Return the actual running container name for docker exec (Compose may prefix e.g. 31f2873beb14_op-and-chloe-openclaw-guard).
+resolve_container_name(){
+  local logical="$1"
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -E "^${logical}$|_${logical}$" | head -1
+}
+
+# Status for 2-column menu display
+step_status(){
+  case "$1" in
+    1) command -v apt-get >/dev/null 2>&1 && [ -f /etc/os-release ] && echo "✅ Ready" || echo "⚪ Not ready" ;;
+    2) if [ -n "${OPENCLAW_VOLUME_ROOT:-}" ]; then echo "✅ ${OPENCLAW_VOLUME_ROOT}"; else echo "⚪ Not set"; fi ;;
+    3) command -v docker >/dev/null 2>&1 && echo "✅ Installed" || echo "⚪ Not installed" ;;
+    4) [ -f "$ENV_FILE" ] && echo "✅ Created" || echo "⚪ Not created" ;;
+    5) check_done browser_init && echo "✅ CDP scripts installed" || echo "⚪ Not installed" ;;
+    6) check_done bitwarden && echo "✅ Configured" || echo "⚪ Not configured" ;;
+    7) if check_done tailscale; then tsip=$(tailscale_ip); echo "✅ Running${tsip:+ ($tsip)}"; else echo "⚪ Not running"; fi ;;
+    8) container_running "$guard_name" && echo "✅ Currently running" || echo "⚪ Not running" ;;
+    9) container_running "$worker_name" && echo "✅ Currently running" || echo "⚪ Not running" ;;
+    10) container_running "$browser_name" && echo "✅ Currently running" || echo "⚪ Not running" ;;
+    11) if [ -n "${PAIRING_COMPLETED-}" ] || [ -f "${OPENCLAW_STATE_DIR:-/var/lib/openclaw/chloe/state}/.pairing_completed" ]; then echo "✅ Pairing completed"; else echo "⚪ Pending pairing"; fi ;;
+    12) configured_label guard ;;
+    13) configured_label worker ;;
+    14) check_seed_done && echo "✅ Seeded" || echo "⚪ Not seeded" ;;
+    15) guard_admin_mode_enabled && echo "⚠️ Enabled (gives guard full VPS access — disable when not needed)" || echo "⚪ Disabled" ;;
+    16) echo "" ;;
+    17) echo "" ;;
+    18) echo "" ;;
+    *) echo "—" ;;
+  esac
+}
+
+# True if both workspaces have .seed_hash matching current core/ (ROLE.md + skills) content
+# (seeded = hash of core/<profile> equals workspace/.seed_hash written at last sync)
+check_seed_done(){
+  local gws="${OPENCLAW_GUARD_WORKSPACE_DIR:-/var/lib/openclaw/guard/workspace}"
+  local wws="${OPENCLAW_WORKSPACE_DIR:-/var/lib/openclaw/chloe/workspace}"
+  local want want_g want_w have_g have_w
+  want_g=$(python3 "$STACK_DIR/scripts/host/seed-hash.py" get "$STACK_DIR" guard 2>/dev/null)
+  want_w=$(python3 "$STACK_DIR/scripts/host/seed-hash.py" get "$STACK_DIR" worker 2>/dev/null)
+  have_g=$(cat "$gws/.seed_hash" 2>/dev/null | tr -d '\n')
+  have_w=$(cat "$wws/.seed_hash" 2>/dev/null | tr -d '\n')
+  [ -n "$want_g" ] && [ "$want_g" = "$have_g" ] || return 1
+  [ -n "$want_w" ] && [ "$want_w" = "$have_w" ] || return 1
+}
+
+configured_label(){
+  local kind="$1"
+  local file
+  if [ "$kind" = "guard" ]; then file="$guard_cfg"; else file="$worker_cfg"; fi
+  if [ ! -s "$file" ]; then
+    echo "⚪ Not configured"
+    return
+  fi
+  if grep -q '"gateway"' "$file" && grep -q '"mode"' "$file"; then
+    echo "✅ Configured"
+  else
+    echo "⚪ Not configured"
+  fi
+}
+
+tailscale_ip(){
+  tailscale ip -4 2>/dev/null | head -n1 || true
+}
+
+tailscale_dns(){
+  tailscale status --json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true
+}
+
+apply_tailscale_serve(){
+  bash "$STACK_DIR/scripts/host/apply-tailscale-serve.sh" && ok "Tailscale serve: 444→guard, 443→worker, 445→webtop" || warn "Tailscale serve failed (is tailscale running?)"
+}
+
+# Sync gateway auth token into openclaw.json so gateway validates the same token we show.
+# Call with: sync_gateway_tokens_to_config <worker_token> <guard_token>
+sync_gateway_tokens_to_config(){
+  local wt="$1" gt="$2"
+  [ -z "$wt" ] && [ -z "$gt" ] && return 0
+  WORKER_TKN="$wt" GUARD_TKN="$gt" python3 - <<'PY'
+import json, pathlib, os
+wt, gt = os.environ.get("WORKER_TKN", ""), os.environ.get("GUARD_TKN", "")
+worker_cfg = pathlib.Path("/var/lib/openclaw/chloe/state/openclaw.json")
+guard_cfg = pathlib.Path("/var/lib/openclaw/guard/state/openclaw.json")
+if wt and worker_cfg.exists():
+    d = json.loads(worker_cfg.read_text())
+    d.setdefault("gateway", {}).setdefault("auth", {})["token"] = wt
+    worker_cfg.write_text(json.dumps(d, indent=2) + "\n")
+if gt and guard_cfg.exists():
+    d = json.loads(guard_cfg.read_text())
+    d.setdefault("gateway", {}).setdefault("auth", {})["token"] = gt
+    guard_cfg.write_text(json.dumps(d, indent=2) + "\n")
+PY
+  chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
+}
+
+enable_tokenless_tailscale_auth(){
+  python3 - <<'PY2'
+import json, pathlib
+paths=[pathlib.Path('/var/lib/openclaw/chloe/state/openclaw.json'), pathlib.Path('/var/lib/openclaw/guard/state/openclaw.json')]
+for p in paths:
+    if not p.exists() or p.stat().st_size==0:
+        continue
+    d=json.loads(p.read_text())
+    g=d.setdefault('gateway',{})
+    a=g.setdefault('auth',{})
+    a['allowTailscale']=True
+    g['trustedProxies']=['127.0.0.1','::1','172.31.0.1']
+    p.write_text(json.dumps(d,indent=2)+"\n")
+PY2
+  chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
+}
+
+# Set gateway.controlUi.allowedOrigins so Control UI works when accessed via Tailscale (non-loopback origin).
+# Call with Tailscale DNS name (e.g. from tailscale_dns). Restart guard/worker after for changes to take effect.
+# Uses paths from ENV_FILE (OPENCLAW_STATE_DIR, OPENCLAW_GUARD_STATE_DIR) when available.
+ensure_control_ui_allowed_origins(){
+  local tsdns="${1:-$(tailscale_dns)}"
+  [ -z "$tsdns" ] || [ "$tsdns" = "unavailable" ] && return 0
+  local worker_state guard_state
+  if [ -f "$ENV_FILE" ]; then
+    worker_state=$(grep -E '^OPENCLAW_STATE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+    guard_state=$(grep -E '^OPENCLAW_GUARD_STATE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+  fi
+  worker_state="${worker_state:-/var/lib/openclaw/chloe/state}"
+  guard_state="${guard_state:-/var/lib/openclaw/guard/state}"
+  TSDNS="$tsdns" WORKER_CFG="${worker_state}/openclaw.json" GUARD_CFG="${guard_state}/openclaw.json" python3 - <<'PY2'
+import json, pathlib, os
+tsdns = os.environ.get("TSDNS", "").strip()
+worker_cfg = pathlib.Path(os.environ.get("WORKER_CFG", "/var/lib/openclaw/chloe/state/openclaw.json"))
+guard_cfg = pathlib.Path(os.environ.get("GUARD_CFG", "/var/lib/openclaw/guard/state/openclaw.json"))
+if not tsdns or tsdns == "unavailable":
+    raise SystemExit(0)
+# Worker: https://host (port 443), Guard: https://host:444. Also allow localhost for SSH tunnel access.
+worker_origins = ["https://" + tsdns, "http://127.0.0.1:18789", "http://localhost:18789"]
+guard_origins = ["https://" + tsdns + ":444", "http://127.0.0.1:18790", "http://localhost:18790"]
+for cfg, origins in [(worker_cfg, worker_origins), (guard_cfg, guard_origins)]:
+    d = {}
+    if cfg.exists() and cfg.stat().st_size > 0:
+        d = json.loads(cfg.read_text())
+    else:
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+    g = d.setdefault("gateway", {})
+    g["trustedProxies"] = ["127.0.0.1", "::1", "172.31.0.1"]
+    g.setdefault("auth", {})["allowTailscale"] = True
+    cu = g.setdefault("controlUi", {})
+    cu["allowedOrigins"] = list(dict.fromkeys((cu.get("allowedOrigins") or []) + origins))
+    cfg.write_text(json.dumps(d, indent=2) + "\n")
+PY2
+  mkdir -p "$worker_state/devices" "$guard_state/devices"
+  chown -R 1000:1000 "$worker_state" "$guard_state" 2>/dev/null || true
+}
+
+apply_tailscale_bind(){ :; }
+
+
+ensure_inline_buttons(){
+  python3 - <<'PY2'
+import json, pathlib
+paths=[pathlib.Path('/var/lib/openclaw/chloe/state/openclaw.json'), pathlib.Path('/var/lib/openclaw/guard/state/openclaw.json')]
+for p in paths:
+    if not p.exists() or p.stat().st_size==0:
+        continue
+    d=json.loads(p.read_text())
+    ch=d.setdefault('channels',{}).setdefault('telegram',{})
+    caps=ch.setdefault('capabilities',{})
+    caps['inlineButtons']='all'
+    p.write_text(json.dumps(d,indent=2)+"\n")
+PY2
+  chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
+}
+
+ensure_browser_profile(){
+  # Prefer dynamic CDP URL from running browser container so Chloe's browser tool stays correct
+  if container_running "$browser_name"; then
+    if STACK_DIR="$STACK_DIR" ENV_FILE="$ENV_FILE" bash "$STACK_DIR/scripts/host/update-webtop-cdp-url.sh" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  # Fallback: set profile with CDP URL from env or default (when browser not running yet)
+  local bip="172.31.0.10"
+  if [ -f "$ENV_FILE" ]; then
+    bip=$(grep -E '^BROWSER_IPV4=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | head -1)
+    [ -z "$bip" ] && bip="172.31.0.10"
+  fi
+  BIP="$bip" python3 - <<'PY2'
+import json, os, pathlib
+bip = os.environ.get("BIP", "172.31.0.10")
+worker=pathlib.Path('/var/lib/openclaw/chloe/state/openclaw.json')
+guard=pathlib.Path('/var/lib/openclaw/guard/state/openclaw.json')
+if worker.exists() and worker.stat().st_size>0:
+    d=json.loads(worker.read_text())
+    b=d.setdefault('browser',{})
+    b['enabled']=True
+    b['defaultProfile']='vps-chromium'
+    prof=b.setdefault('profiles',{})
+    p=prof.setdefault('vps-chromium',{})
+    p['cdpUrl']=f'http://{bip}:9223'
+    p.setdefault('color','#00AAFF')
+    worker.write_text(json.dumps(d,indent=2)+"\n")
+if guard.exists() and guard.stat().st_size>0:
+    d=json.loads(guard.read_text())
+    d.setdefault('browser',{})['enabled']=False
+    guard.write_text(json.dumps(d,indent=2)+"\n")
+PY2
+  chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
+}
+
+
+# Bitwarden lives in worker state (Chloe); no bridge.
+STATE_DIR="${OPENCLAW_STATE_DIR:-/var/lib/openclaw/chloe/state}"
+BW_CLI_DATA_DIR_HOST="$STATE_DIR/bitwarden-cli"
+BW_CLI_DATA_DIR_WORKER="/home/node/.openclaw/bitwarden-cli"
+
+bitwarden_env_hash(){
+  local f="$1"
+  [ -f "$f" ] || return 1
+  sha256sum < "$f" 2>/dev/null | cut -d' ' -f1 || openssl dgst -sha256 -r 2>/dev/null < "$f" | cut -d' ' -f1
+}
+
+verify_bitwarden_credentials(){
+  local secrets_file="$1"
+  local secrets_dir="$2"
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+  local state_dir
+  state_dir="$(dirname "$secrets_dir")"
+  if docker run --rm \
+    -v "$state_dir:/home/node/.openclaw:rw" \
+    --env-file "$secrets_file" \
+    -e BITWARDENCLI_APPDATA_DIR="$BW_CLI_DATA_DIR_WORKER" \
+    node:20-alpine sh -c '
+      npm install -g @bitwarden/cli >/dev/null 2>&1 &&
+      bw status 2>/dev/null | grep -qv "unauthenticated"
+    ' >/dev/null 2>&1; then
+    local h
+    h=$(bitwarden_env_hash "$secrets_file")
+    [ -n "$h" ] && echo "$h" > "$secrets_dir/.bw_verified" && chmod 600 "$secrets_dir/.bw_verified" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+# Check if Bitwarden is unlocked in the worker container. Returns 0 if unlocked, 1 if worker not running, 2 if locked.
+check_bitwarden_unlocked_in_worker(){
+  local worker_actual
+  worker_actual=$(resolve_container_name "$worker_name" 2>/dev/null)
+  worker_actual=${worker_actual:-$worker_name}
+  if ! container_running "$worker_name"; then
+    return 1
+  fi
+  if docker exec "$worker_actual" sh -lc '
+    export BITWARDENCLI_APPDATA_DIR=/home/node/.openclaw/bitwarden-cli
+    . /home/node/.openclaw/secrets/bitwarden.env 2>/dev/null || true
+    [ -f /home/node/.openclaw/secrets/bw-session ] && export BW_SESSION=$(cat /home/node/.openclaw/secrets/bw-session)
+    bw config server "$BW_SERVER" >/dev/null 2>&1 || true
+    s=$(bw status 2>/dev/null || true)
+    echo "$s" | grep -q "\"status\":\"unlocked\""
+  ' 2>/dev/null; then
+    return 0
+  fi
+  return 2
+}
+
+# Unlock the vault and persist the session key so the worker can use bw.
+# Password is read once and passed via a temp file that is removed immediately; only the session key is written to worker state.
+BW_SESSION_FILE_NAME="bw-session"
+BW_STEP6_MARKER="$STATE_DIR/secrets/.bw_configured"
+
+write_bw_configured_marker(){
+  local secrets_dir="${1:-$STATE_DIR/secrets}"
+  touch "$secrets_dir/.bw_configured" 2>/dev/null && chmod 600 "$secrets_dir/.bw_configured" && chown 1000:1000 "$secrets_dir/.bw_configured" 2>/dev/null
+}
+
+run_bitwarden_unlock_interactive(){
+  local state_dir="$1"
+  local secrets_dir="$state_dir/secrets"
+  local session_file="$secrets_dir/$BW_SESSION_FILE_NAME"
+  say "Unlock the vault. Enter your master password (used only for this unlock; it is not stored)."
+  # Use a global name so the RETURN trap can still rm the file after the function returns (locals are gone then).
+  _bw_tmp_pw=$(mktemp)
+  chmod 600 "$_bw_tmp_pw"
+  trap 'rm -f "$_bw_tmp_pw"' RETURN
+  read -rs -p "$TIGER Master password: " pw
+  echo
+  printf '%s' "$pw" > "$_bw_tmp_pw"
+  unset pw
+  if [ ! -s "$_bw_tmp_pw" ]; then
+    warn "No password entered. Run this step from a terminal (TTY) so the password prompt works."
+    return
+  fi
+
+  local session_key unlock_stderr
+  # Do not run bw config server here: login already set it in the same state_dir; running it again causes "Logout required before server config update".
+  unlock_stderr=$(docker run -i --rm \
+    -v "$state_dir:/home/node/.openclaw:rw" \
+    -v "$_bw_tmp_pw:/tmp/bw-pw:ro" \
+    -e BITWARDENCLI_APPDATA_DIR="$BW_CLI_DATA_DIR_WORKER" \
+    node:20-alpine sh -c 'npm install -g @bitwarden/cli >/dev/null 2>&1 && bw unlock --raw --passwordfile /tmp/bw-pw' 2>&1) || true
+  session_key=$(printf '%s' "$unlock_stderr" | head -1)
+  if ! printf '%s' "$session_key" | grep -qE '^[A-Za-z0-9+/]+=*$'; then
+    session_key=""
+  fi
+
+  if [ -n "$session_key" ]; then
+    echo -n "$session_key" > "$session_file"
+    chmod 600 "$session_file"
+    chown 1000:1000 "$session_file" 2>/dev/null || true
+    ok "Session key saved so Chloe (worker) can use Bitwarden (re-run this step if the vault is locked later)."
+  else
+    warn "Unlock failed or session could not be captured; try again or run step 6 again."
+    [ -n "$unlock_stderr" ] && echo "$unlock_stderr" | sed 's/^/  /'
+  fi
+}
+
+step_bitwarden_secrets(){
+  local secrets_dir="$STATE_DIR/secrets"
+  local secrets_file="$secrets_dir/bitwarden.env"
+  local bw_data_dir="$BW_CLI_DATA_DIR_HOST"
+  mkdir -p "$secrets_dir" "$bw_data_dir"
+  chmod 700 "$secrets_dir" "$bw_data_dir"
+  chown 1000:1000 "$secrets_dir" "$bw_data_dir" 2>/dev/null || true
+
+  if [ -f "$secrets_file" ]; then
+    say "Configure Bitwarden for Chloe (worker)"
+    say "Verifying existing login state..."
+    if verify_bitwarden_credentials "$secrets_file" "$secrets_dir"; then
+      ok "Bitwarden logged in"
+      if check_bitwarden_unlocked_in_worker; then
+        ok "Bitwarden unlocked"
+        write_bw_configured_marker "$secrets_dir"
+        return
+      fi
+      run_bitwarden_unlock_interactive "$STATE_DIR"
+      if [ -f "$secrets_dir/$BW_SESSION_FILE_NAME" ]; then
+        chown -R 1000:1000 "$bw_data_dir" 2>/dev/null || true
+        ok "Bitwarden unlocked"
+        write_bw_configured_marker "$secrets_dir"
+      fi
+      return
+    fi
+    warn "Existing login missing or expired — you will log in again below"
+    echo
+  fi
+
+  say "Configure Bitwarden for Chloe (worker) — no master password stored"
+  say "We use Bitwarden so Chloe can access credentials (email, O365, etc.). You log in and unlock in this step. Only BW_SERVER and the session key from unlock are saved; your master password is never written to disk."
+  say "Create a free account on https://vault.bitwarden.com or https://vault.bitwarden.eu — whichever is closer to you."
+
+  local cur_server=""
+  local default_choice="1"
+  if [ -f "$secrets_file" ]; then
+    cur_server=$(grep '^BW_SERVER=' "$secrets_file" | cut -d= -f2- || true)
+    ok "Existing bitwarden.env found"
+    [[ "$cur_server" == *".com"* ]] && default_choice="1" || default_choice="2"
+  fi
+
+  echo "  1) I use https://vault.bitwarden.com"
+  echo "  2) I use https://vault.bitwarden.eu"
+  read -r -p "$TIGER BW server [1 or 2]: " ans
+  ans=${ans:-$default_choice}
+  if [[ "$ans" == "1" ]]; then
+    BW_SERVER="https://vault.bitwarden.com"
+  else
+    BW_SERVER="https://vault.bitwarden.eu"
+  fi
+
+  rm -f "$secrets_dir/.bw_verified" "$secrets_dir/.bw_configured"
+  cat > "$secrets_file" <<EOF
+BW_SERVER=$BW_SERVER
+EOF
+  chmod 600 "$secrets_file"
+  chown 1000:1000 "$secrets_file" 2>/dev/null || true
+  ok "Saved $secrets_file (server URL only; no passwords or credentials stored)"
+
+  say "Log in and unlock here (email, master password, 2FA if enabled). Your password is not stored; only the session key is saved so Chloe can use Bitwarden."
+  say "Getting config... (please wait for the login prompt)"
+  do_bw_login(){
+    export BITWARDENCLI_APPDATA_DIR="$bw_data_dir"
+    bw logout 2>/dev/null || true
+    bw config server "$BW_SERVER" && bw login
+  }
+  if command -v bw >/dev/null 2>&1; then
+    if ! do_bw_login; then
+      warn "Bitwarden login failed or was cancelled"
+      return
+    fi
+    chown -R 1000:1000 "$bw_data_dir" 2>/dev/null || true
+  elif command -v docker >/dev/null 2>&1; then
+    if ! docker run -it --rm \
+      -v "$STATE_DIR:/home/node/.openclaw:rw" \
+      -e BITWARDENCLI_APPDATA_DIR="$BW_CLI_DATA_DIR_WORKER" \
+      -e BW_SERVER="$BW_SERVER" \
+      node:20-alpine sh -c 'npm install -g @bitwarden/cli >/dev/null 2>&1 && bw logout 2>/dev/null || true && bw config server "$BW_SERVER" && bw login'; then
+      warn "Bitwarden login failed or was cancelled"
+      return
+    fi
+    chown -R 1000:1000 "$bw_data_dir" 2>/dev/null || true
+  else
+    warn "Install Bitwarden CLI (npm install -g @bitwarden/cli) or Docker, then re-run this step"
+    return
+  fi
+
+  say "Verifying login..."
+  if verify_bitwarden_credentials "$secrets_file" "$secrets_dir"; then
+    ok "Bitwarden logged in"
+    say "Unlock the vault so Chloe can read secrets."
+    run_bitwarden_unlock_interactive "$STATE_DIR"
+    chown -R 1000:1000 "$bw_data_dir" 2>/dev/null || true
+    if [ -f "$secrets_dir/$BW_SESSION_FILE_NAME" ]; then
+      ok "Bitwarden unlocked"
+      write_bw_configured_marker "$secrets_dir"
+    fi
+  else
+    if command -v docker >/dev/null 2>&1; then
+      warn "Verification failed — ensure worker state is at the default path or run this step again"
+    else
+      warn "Docker not installed — skipping verification (run step 2 first)"
+    fi
+  fi
+}
+
+guard_admin_mode_enabled(){
+  grep -q '/var/lib/openclaw:/mnt/openclaw-data' "$STACK_DIR/compose.yml"
+}
+
+# SSH key for Op to connect back to host (Admin Mode). Stored in guard/state, mounted into container when admin mode on.
+ensure_guard_ssh_to_host(){
+  local ssh_dir="/var/lib/openclaw/guard/state/ssh"
+  local key_file="$ssh_dir/id_ed25519"
+  local auth_keys="/root/.ssh/authorized_keys"
+  mkdir -p "$ssh_dir"
+  if [ ! -f "$key_file" ]; then
+    ssh-keygen -t ed25519 -f "$key_file" -N "" -C "openclaw-guard-admin" -q
+    ok "Generated SSH key for Op→host at $ssh_dir"
+  fi
+  chown -R 1000:1000 "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  [ -f "$key_file" ] && chmod 600 "$key_file"
+  mkdir -p /root/.ssh
+  touch "$auth_keys"
+  chmod 600 "$auth_keys"
+  if ! grep -q "openclaw-guard-admin" "$auth_keys" 2>/dev/null; then
+    cat "${key_file}.pub" >> "$auth_keys"
+    ok "Added Op SSH public key to $auth_keys (Op can ssh root@localhost when Admin Mode is on)"
+  fi
+}
+
+set_guard_admin_mode(){
+  local mode="$1"  # on|off
+  local c="$STACK_DIR/compose.yml"
+  if [ "$mode" = "on" ]; then
+    ensure_guard_ssh_to_host
+    if ! grep -q '/var/lib/openclaw:/mnt/openclaw-data' "$c"; then
+      sed -i '/OPENCLAW_GUARD_WORKSPACE_DIR.*workspace/a\
+      - /var/lib/openclaw:/mnt/openclaw-data\
+      - /etc/openclaw:/mnt/etc-openclaw\
+      - /var/lib/openclaw/guard/state/ssh:/home/node/.ssh:ro' "$c"
+    elif ! grep -q '/var/lib/openclaw/guard/state/ssh:/home/node/.ssh' "$c"; then
+      sed -i '\# /etc/openclaw:/mnt/etc-openclaw#a\
+      - /var/lib/openclaw/guard/state/ssh:/home/node/.ssh:ro' "$c"
+    fi
+    ok "Guard admin mode enabled (full host data/config mounted; Op can SSH to host as root@localhost)"
+  else
+    sed -i '\# /var/lib/openclaw:/mnt/openclaw-data#d' "$c"
+    sed -i '\# /etc/openclaw:/mnt/etc-openclaw#d' "$c"
+    sed -i '\# /var/lib/openclaw/guard/state/ssh:/home/node/.ssh#d' "$c"
+    ok "Guard admin mode disabled (minimal mounts; Op cannot SSH to host)"
+  fi
+  cd "$STACK_DIR"
+  docker compose --env-file "$ENV_FILE" -f compose.yml up -d --force-recreate openclaw-guard >/dev/null || true
+}
+
+step_guard_admin_mode(){
+  say "Guard admin mode"
+  say "When enabled: guard can access /var/lib/openclaw and /etc/openclaw, and Op can SSH back to this host (e.g. ssh root@localhost) for shell access."
+  if guard_admin_mode_enabled; then
+    warn "Admin mode is ON. Op has full access to this VPS (data, config, SSH). Enable only temporarily when absolutely necessary."
+    ok "Current: ENABLED"
+    read -r -p "$TIGER Disable admin mode now? [y/N]: " ans
+    case "${ans:-n}" in
+      y|Y) set_guard_admin_mode off ;;
+      *) ok "No changes" ;;
+    esac
+  else
+    ok "Current: DISABLED"
+    read -r -p "$TIGER Enable admin mode now? [y/N]: " ans
+    case "${ans:-n}" in
+      y|Y)
+        warn "Admin mode gives Op full access to this VPS. Enable only temporarily when absolutely necessary."
+        set_guard_admin_mode on
+        ;;
+      *) ok "No changes" ;;
+    esac
+  fi
+}
+
+
+
+ensure_guard_approval_instructions(){
+  local gws="/var/lib/openclaw/guard/workspace"
+  mkdir -p "$gws"
+  cat > "$gws/APPROVALS.md" <<'EOF'
+# Exec Approvals (OpenClaw)
+
+Op is the admin instance. When Op runs a host command that isn’t on the allowlist, OpenClaw may prompt for approval.
+
+- Pending / allowlist: ./openclaw-guard approvals get --json
+- Add allowlist: ./openclaw-guard approvals allowlist add "<path or glob>"
+- Approve in Control UI: Nodes → Exec approvals
+- In chat: /approve <id> allow-once | allow-always | deny
+EOF
+  chown 1000:1000 "$gws/APPROVALS.md" 2>/dev/null || true
+}
+
+
+
+# Injects core/guard/*.md and core/worker/*.md into guard/workspace and chloe/workspace.
+# Run before starting guard/worker (steps 7–8) so containers see ROLE.md on first start,
+# and before configuring them (steps 10–11) so onboarding uses the latest core.
+sync_core_workspaces(){
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$ENV_FILE" 2>/dev/null || true
+    set +a
+  fi
+  bash "$STACK_DIR/scripts/host/sync-workspaces.sh" >/dev/null 2>&1 || true
+  fix_workspace_ownership
+}
+
+# Ensure repo files are writable by the runtime user (avoid root-owned drift)
+fix_repo_ownership(){
+  local repo="${STACK_DIR:-/opt/op-and-chloe}"
+  chown -R 1000:1000 "$repo" 2>/dev/null || true
+}
+
+# Ensure workspace dirs are writable by the container (uid 1000). Fixes EACCES on AGENTS.md etc.
+fix_workspace_ownership(){
+  local wws gws
+  if [ -f "$ENV_FILE" ]; then
+    wws=$(grep -E '^OPENCLAW_WORKSPACE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+    gws=$(grep -E '^OPENCLAW_GUARD_WORKSPACE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+  fi
+  wws="${wws:-/var/lib/openclaw/chloe/workspace}"
+  gws="${gws:-/var/lib/openclaw/guard/workspace}"
+  chown -R 1000:1000 "$wws" "$gws" 2>/dev/null || true
+}
+
+ensure_repo_writable_for_guard(){
+  say "Ensure repo is writable for guard"
+  say "We set permissions so the guard can edit stack scripts when needed."
+
+  fix_repo_ownership
+
+  # Avoid git ownership/filemode noise
+  git -C "$STACK_DIR" config core.fileMode false 2>/dev/null || true
+  git config --global --add safe.directory "$STACK_DIR" 2>/dev/null || true
+
+  # Also inside guard container (path is /opt/op-and-chloe)
+  if container_running "$guard_name"; then
+    guard_actual=$(resolve_container_name "$guard_name" 2>/dev/null); guard_actual=${guard_actual:-$guard_name}
+    docker exec "$guard_actual" sh -lc 'git config --global --add safe.directory /opt/op-and-chloe >/dev/null 2>&1 || true'
+  fi
+
+  ok "Repo permissions/safe.directory configured"
+}
+
+ensure_worker_scripts(){
+  local scripts_dir="$STACK_DIR/scripts/worker"
+  mkdir -p "$scripts_dir"
+  chmod 0755 "$scripts_dir/bw" "$scripts_dir/m365" \
+    "$scripts_dir/email-setup.py" "$scripts_dir/get-email-password.py" \
+    "$scripts_dir/fetch-o365-config.py" "$scripts_dir/m365.py" 2>/dev/null || true
+  chown 1000:1000 "$scripts_dir/bw" "$scripts_dir/m365" \
+    "$scripts_dir/email-setup.py" "$scripts_dir/get-email-password.py" \
+    "$scripts_dir/fetch-o365-config.py" "$scripts_dir/m365.py" 2>/dev/null || true
+}
+
+ensure_stack_repo_alias(){
+  # Keep /opt/op-and-chloe available for scripts that rely on canonical path.
+  local canonical="/opt/op-and-chloe"
+  mkdir -p /opt
+  if [ -L "$canonical" ]; then
+    local cur
+    cur=$(readlink -f "$canonical" 2>/dev/null || true)
+    if [ "$cur" != "$STACK_DIR" ]; then
+      ln -snf "$STACK_DIR" "$canonical"
+    fi
+  elif [ -e "$canonical" ]; then
+    warn "$canonical exists and is not a symlink; leaving as-is"
+  else
+    ln -snf "$STACK_DIR" "$canonical"
+  fi
+}
+
+check_done(){
+  local id="$1"
+  case "$id" in
+    docker) command -v docker >/dev/null 2>&1 ;;
+    env) [ -f "$ENV_FILE" ] ;;
+    browser_init) [ -f /var/lib/openclaw/browser/custom-cont-init.d/20-start-chromium-cdp ] && [ -f /var/lib/openclaw/browser/custom-cont-init.d/30-start-socat-cdp-proxy ] ;;
+    running) container_running "$worker_name" && container_running "$guard_name" ;;
+    tailscale) tailscale status >/dev/null 2>&1 ;;
+    bitwarden)
+      [ -f "$BW_STEP6_MARKER" ] && return 0
+      local bw_env="$STATE_DIR/secrets/bitwarden.env"
+      local bw_verified="$STATE_DIR/secrets/.bw_verified"
+      local bw_session_file="$STATE_DIR/secrets/bw-session"
+      [ -f "$bw_env" ] || return 1
+      grep -q '^BW_SERVER=' "$bw_env" || return 1
+      local want_h got_h
+      want_h=$(bitwarden_env_hash "$bw_env" 2>/dev/null)
+      got_h=$(cat "$bw_verified" 2>/dev/null)
+      if ! container_running "$worker_name"; then
+        [ -f "$bw_verified" ] && [ -n "$want_h" ] && [ "$want_h" = "$got_h" ] && return 0
+        [ -s "$bw_session_file" ] && return 0
+        return 1
+      fi
+      worker_actual=$(resolve_container_name "$worker_name" 2>/dev/null)
+      worker_actual=${worker_actual:-$worker_name}
+      if docker exec "$worker_actual" sh -lc '
+        set -e
+        command -v bw >/dev/null 2>&1
+        . /home/node/.openclaw/secrets/bitwarden.env
+        [ -n "$BW_SERVER" ]
+        export BITWARDENCLI_APPDATA_DIR="/home/node/.openclaw/bitwarden-cli"
+        [ -f /home/node/.openclaw/secrets/bw-session ] && export BW_SESSION=$(cat /home/node/.openclaw/secrets/bw-session)
+        bw config server "$BW_SERVER" >/dev/null 2>&1
+        bw status >/tmp/bw-status.json 2>/dev/null || exit 1
+        grep -q '"status":"unauthenticated"' /tmp/bw-status.json && exit 1
+        grep -q '"status":"unlocked"' /tmp/bw-status.json || exit 1
+      ' >/dev/null 2>&1; then
+        return 0
+      fi
+      [ -s "$bw_session_file" ] && return 0
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+step_volume_root(){
+  say "Step 2: OpenClaw data location (persistent volume)"
+  say "On a VPS with a persistent volume, choose where OpenClaw config and state should live."
+  echo
+  # Build menu: 0 = back, 1..n = /mnt/* dirs, last = default location
+  local idx=0
+  local -a options=()
+  local -a paths=()
+  options+=("Return to main menu")
+  paths+=("")
+  if [ -d /mnt ]; then
+    local d
+    for d in /mnt/*/; do
+      [ -d "$d" ] || continue
+      d=${d%/}
+      options+=("$d")
+      paths+=("$d")
+    done
+  fi
+  options+=("Default location (no volume): /var/lib/openclaw and /etc/openclaw")
+  paths+=("default")
+  echo "  Current: ${OPENCLAW_VOLUME_ROOT:-<default>}"
+  echo
+  local i=0
+  while [ "$i" -lt "${#options[@]}" ]; do
+    printf "  %d. %s\n" "$i" "${options[$i]}"
+    i=$((i + 1))
+  done
+  echo
+  read -r -p "$TIGER Select [0-$(( ${#options[@]} - 1 ))]: " pick
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -lt 0 ] || [ "$pick" -ge "${#options[@]}" ]; then
+    warn "Invalid choice"
+    return 0
+  fi
+  if [ "$pick" -eq 0 ]; then
+    say "No change."
+    return 0
+  fi
+  local chosen_path="${paths[$pick]}"
+  if [ "$chosen_path" = "default" ]; then
+    rm -f "$VOLUME_ROOT_FILE"
+    unset OPENCLAW_VOLUME_ROOT
+    ok "Using default location: /var/lib/openclaw and /etc/openclaw (no persistent volume)"
+    return 0
+  fi
+  echo "$chosen_path" > "$VOLUME_ROOT_FILE"
+  OPENCLAW_VOLUME_ROOT=$chosen_path
+  ok "OpenClaw data will use: $OPENCLAW_VOLUME_ROOT"
+  say "Run step 3 (docker) next to install Docker and Compose."
+}
+
+step_preflight(){
+  say "Step 1: Preflight checks"
+  say "We verify your host is ready (Ubuntu/Debian, disk space) before proceeding."
+  command -v apt-get >/dev/null
+  . /etc/os-release
+  ok "Host OS: $PRETTY_NAME"
+  ok "Disk free on /: $(df -h / | awk 'NR==2 {print $4}')"
+}
+
+step_docker(){
+  say "Step 3: Docker + Compose"
+  say "We use Docker to run the guard, worker and browser as safe, isolated containers."
+  if check_done docker; then ok "Docker already installed"; return; fi
+  say "Installing Docker..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null
+  apt-get install -y ca-certificates curl gnupg >/dev/null
+  install -m 0755 -d /etc/apt/keyrings
+  [ -f /etc/apt/keyrings/docker.gpg ] || { curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; chmod a+r /etc/apt/keyrings/docker.gpg; }
+  . /etc/os-release
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -y >/dev/null
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  ok "Docker installed"
+}
+
+step_env(){
+  say "Step 4: State dirs + environment"
+  say "We create directories and an env file so your config and state survive restarts."
+  if [ -n "${OPENCLAW_VOLUME_ROOT:-}" ]; then
+    local etc_dest="$OPENCLAW_VOLUME_ROOT/openclaw/etc/openclaw"
+    local lib_dest="$OPENCLAW_VOLUME_ROOT/openclaw/var/lib/openclaw"
+    mkdir -p "$etc_dest" "$lib_dest"/{chloe/state,chloe/state/devices,chloe/workspace,guard/state,guard/state/devices,guard/workspace,browser}
+    chown -R 1000:1000 "$lib_dest"
+    if [ ! -L /etc/openclaw ] && [ -e /etc/openclaw ] && [ "$(readlink -f /etc/openclaw 2>/dev/null)" != "$(readlink -f "$etc_dest" 2>/dev/null)" ]; then
+      warn "/etc/openclaw already exists and is not a symlink; skipping symlink (data stays under /etc/openclaw)"
+    else
+      ln -snf "$etc_dest" /etc/openclaw
+    fi
+    if [ ! -L /var/lib/openclaw ] && [ -e /var/lib/openclaw ] && [ "$(readlink -f /var/lib/openclaw 2>/dev/null)" != "$(readlink -f "$lib_dest" 2>/dev/null)" ]; then
+      warn "/var/lib/openclaw already exists and is not a symlink; skipping symlink (data stays under /var/lib/openclaw)"
+    else
+      ln -snf "$lib_dest" /var/lib/openclaw
+    fi
+    ok "Created dirs under $OPENCLAW_VOLUME_ROOT and linked /etc/openclaw, /var/lib/openclaw"
+  else
+    mkdir -p /etc/openclaw /var/lib/openclaw/{chloe/state,chloe/state/devices,chloe/workspace,guard/state,guard/state/devices,guard/workspace,browser}
+    chown -R 1000:1000 /var/lib/openclaw/chloe /var/lib/openclaw/guard /var/lib/openclaw/browser
+  fi
+  if [ ! -f "$ENV_FILE" ]; then
+    cp "$STACK_DIR/config/env.example" "$ENV_FILE"
+    sed -i "s#^OPENCLAW_GATEWAY_TOKEN=.*#OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)#" "$ENV_FILE"
+    sed -i "s#^OPENCLAW_GUARD_GATEWAY_TOKEN=.*#OPENCLAW_GUARD_GATEWAY_TOKEN=$(openssl rand -hex 24)#" "$ENV_FILE"
+    sed -i "s#^OPENCLAW_STACK_DIR=.*#OPENCLAW_STACK_DIR=$STACK_DIR#" "$ENV_FILE"
+    ok "Created $ENV_FILE with fresh gateway tokens"
+  else
+    ok "Env already present: $ENV_FILE"
+  fi
+  echo
+  echo "Created:"
+  echo "  /etc/openclaw/"
+  echo "  /var/lib/openclaw/guard/state"
+  echo "  /var/lib/openclaw/guard/workspace"
+  echo "  /var/lib/openclaw/chloe/state"
+  echo "  /var/lib/openclaw/chloe/workspace"
+  echo "  /var/lib/openclaw/browser"
+  echo "  $ENV_FILE"
+}
+
+step_browser_init(){
+  say "Step 5: Browser CDP init scripts"
+  say "We install scripts so Chromium starts with remote-debugging on port 9222, proxied to 9223 for automation."
+  local browser_dir="/var/lib/openclaw/browser"
+  mkdir -p "$browser_dir/custom-cont-init.d"
+  install -m 0755 "$STACK_DIR/scripts/host/webtop-init/20-start-chromium-cdp" "$browser_dir/custom-cont-init.d/20-start-chromium-cdp"
+  install -m 0755 "$STACK_DIR/scripts/host/webtop-init/30-start-socat-cdp-proxy" "$browser_dir/custom-cont-init.d/30-start-socat-cdp-proxy"
+  chown -R 1000:1000 "$browser_dir/custom-cont-init.d"
+  ok "CDP init scripts installed"
+
+  say "CDP watchdog (systemd timer)"
+  say "We install a timer that restarts the browser container if CDP becomes unreachable."
+  install -m 0644 "$STACK_DIR/systemd/openclaw-cdp-watchdog.timer" /etc/systemd/system/
+  sed "s#/opt/op-and-chloe#$STACK_DIR#g" "$STACK_DIR/systemd/openclaw-cdp-watchdog.service" > /etc/systemd/system/openclaw-cdp-watchdog.service
+  systemctl daemon-reload
+  systemctl enable --now openclaw-cdp-watchdog.timer 2>/dev/null || true
+  ok "CDP watchdog timer installed and enabled"
+}
+
+step_tailscale(){
+  say "Step 7: Network Access Setup"
+  say "Exposing dashboards to the public internet (0.0.0.0) instead of using Tailscale..."
+  sed -i "s/^GATEWAY_HOST=.*/GATEWAY_HOST=0.0.0.0/" "$ENV_FILE" 2>/dev/null || true
+  sed -i "s/^GUARD_GATEWAY_HOST=.*/GUARD_GATEWAY_HOST=0.0.0.0/" "$ENV_FILE" 2>/dev/null || true
+  sed -i "s/^NOVNC_HOST=.*/NOVNC_HOST=0.0.0.0/" "$ENV_FILE" 2>/dev/null || true
+  
+  if { container_running "$guard_name" || container_running "$worker_name"; }; then
+    say "Restarting containers to apply bindings..."
+    cd "$STACK_DIR"
+    docker compose --env-file "$ENV_FILE" -f compose.yml restart openclaw-guard openclaw-gateway browser 2>/dev/null || true
+  fi
+  ok "Dashboards are now configured to be accessible publicly via Gateway Tokens."
+}
+
+step_start_guard(){
+  sync_core_workspaces
+  ensure_stack_repo_alias
+  say "Start guard service"
+  say "Op is the admin instance with SSH access — for fixing Chloe, restarts, and large architectural changes."
+  if container_running "$guard_name"; then ok "Guard already running"; return; fi
+  cd "$STACK_DIR"
+  say "Building guard image (openclaw-guard-tools:local) if needed..."
+  docker compose --env-file "$ENV_FILE" -f compose.yml build openclaw-guard
+  docker compose --env-file "$ENV_FILE" -f compose.yml up -d openclaw-guard
+  ok "Guard started"
+}
+
+step_start_worker(){
+  sync_core_workspaces
+  ensure_worker_scripts
+  say "Start worker service"
+  say "Chloe is the day-to-day instance — create all agents here; you'll chat with her daily."
+  if container_running "$worker_name"; then ok "Worker already running"; return; fi
+  cd "$STACK_DIR"
+  say "Building worker image (openclaw-worker-tools:local) if needed..."
+  docker compose --env-file "$ENV_FILE" -f compose.yml build openclaw-gateway
+  docker compose --env-file "$ENV_FILE" -f compose.yml up -d openclaw-gateway
+  ok "Worker started"
+}
+
+step_start_browser(){
+  say "Start browser service"
+  say "The webtop runs a Chromium browser with a persistent profile, so Chloe can log into sites and automate them."
+  if container_running "$browser_name"; then ok "Browser already running"; return; fi
+  cd "$STACK_DIR"
+  docker compose --env-file "$ENV_FILE" -f compose.yml up -d browser
+  ok "Browser started"
+}
+
+step_start_all(){
+  sync_core_workspaces
+  ensure_stack_repo_alias
+  ensure_repo_writable_for_guard
+  ensure_worker_scripts
+  ensure_browser_profile
+  ensure_inline_buttons
+  say "Start full stack"
+  say "This starts all three services together so the stack is ready."
+  STACK_DIR="$STACK_DIR" ENV_FILE="$ENV_FILE" "$STACK_DIR/start.sh"
+  ok "Start sequence finished"
+}
+
+step_verify(){
+  say "Run healthcheck"
+  say "We run health checks to confirm everything is working."
+  STACK_DIR="$STACK_DIR" "$STACK_DIR/healthcheck.sh" || true
+  ok "Healthcheck executed"
+}
+
+step_restart_all(){
+  say "Restart all services"
+  say "Stops the stack and starts it again (guard, worker, browser)."
+  STACK_DIR="$STACK_DIR" ENV_FILE="$ENV_FILE" "$STACK_DIR/restart.sh"
+  ok "Restart finished"
+}
+
+step_seed_instructions(){
+  say "Seed guard / worker instructions"
+  say "Copies the latest role text from core/guard and core/worker into the guard and worker workspaces. Run this after a git pull or when you edit core/ to refresh Op and Chloe instructions."
+  bash "$STACK_DIR/scripts/host/sync-workspaces.sh"
+  ok "Guard and worker workspaces updated from core/"
+}
+
+title_case_name(){ local n="$1"; echo "${n^}"; }
+
+step_configure_guard(){
+  local pretty
+  pretty=$(title_case_name "$INSTANCE")
+  "$STACK_DIR/openclaw-guard" config set gateway.port 18790 >/dev/null 2>&1 || true
+  "$STACK_DIR/openclaw-guard" config set gateway.bind loopback >/dev/null 2>&1 || true
+  say "Run configure guard"
+  say "Op is your admin instance — connect a model and Telegram bot so you can talk to Op for fixing Chloe, restarts, and admin."
+  echo
+  sep
+  echo "Tips for guard onboarding:"
+  echo "  1. Select QuickStart."
+  echo "  2. If you already pay for ChatGPT, we recommend: OpenAI (Codex OAuth + API key)"
+  echo "  3. Select: OpenAI Codex (ChatGPT OAuth)"
+  echo "  4. After you log in to OpenAI, you may see a \"This site can't be reached\" page — that's expected. Simply copy the URL from the browser and paste it into the terminal when asked."
+  echo "  5. Default Model: Keep current"
+  echo "  6. Select channel: we recommend Telegram (Bot API). Install Telegram on your phone if you don't have it yet."
+  echo "  7. Follow the instructions and paste back the Telegram token."
+  echo
+  echo "Suggested bot name: ${pretty}-guard-bot"
+  echo
+  echo "┌────────────────────────────────────────────────────────┐"
+  echo "│ ⚠️  If the onboard script exits early, run this to     │"
+  echo "│     launch it again: ./openclaw-guard onboard          │"
+  echo "└────────────────────────────────────────────────────────┘"
+  echo
+  read -r -p "$TIGER Start guard onboarding now? [Y/n]: " go
+  if [[ ! "$go" =~ ^[Nn]$ ]]; then
+    if ! container_running "$guard_name"; then
+      warn "Guard container is not running. Run step 7 first, then try again."
+      return
+    fi
+    guard_actual=$(resolve_container_name "$guard_name" 2>/dev/null); guard_actual=${guard_actual:-$guard_name}
+    echo
+    say "Launching guard onboarding in this terminal (not a subprocess). When you're done, run: sudo ./setup.sh"
+    echo
+    exec docker exec -it "$guard_actual" ./openclaw.mjs onboard
+  else
+    ok "Skipped guard onboarding"
+  fi
+}
+
+step_configure_worker(){
+  local pretty
+  pretty=$(title_case_name "$INSTANCE")
+  say "Run configure worker"
+  say "Chloe is your day-to-day instance — connect models and Telegram bot here; create all agents here."
+  echo
+  sep
+  echo "Recommended worker setup:"
+  echo "  • Day-to-day instance — create all agents here"
+  echo "  • Connect your primary model(s) and tools here"
+  echo "  • Set up a dedicated Telegram bot for daily chat"
+  echo "  • Suggested bot name: ${pretty}-bot"
+  echo "  • Use ./openclaw-worker ... for worker-only commands"
+  echo
+  echo "┌────────────────────────────────────────────────────────┐"
+  echo "│ ⚠️  If the onboard script exits early, run this to     │"
+  echo "│     launch it again: ./openclaw-worker onboard         │"
+  echo "└────────────────────────────────────────────────────────┘"
+  echo
+  read -r -p "$TIGER Start worker onboarding now? [Y/n]: " go
+  if [[ ! "$go" =~ ^[Nn]$ ]]; then
+    if ! container_running "$worker_name"; then
+      warn "Worker container is not running. Run step 8 first, then try again."
+      return
+    fi
+    worker_actual=$(resolve_container_name "$worker_name" 2>/dev/null); worker_actual=${worker_actual:-$worker_name}
+    echo
+    say "Launching worker onboarding in this terminal (not a subprocess). When you're done, run: sudo ./setup.sh"
+    echo
+    exec docker exec -it "$worker_actual" ./openclaw.mjs onboard
+  else
+    ok "Skipped worker onboarding"
+  fi
+}
+
+
+# True if this instance's "devices list" output shows pairing completed: at least one Paired, no Pending (N) with N>=1
+pairing_done_for_output(){
+  local out="$1"
+  echo "$out" | grep -q 'Paired ([1-9]' && ! echo "$out" | grep -q 'Pending ([1-9]'
+}
+
+# Run guard/worker devices list and set PAIRING_COMPLETED=1 only when both have pairing completed.
+# Also write/remove a marker file so the main menu can show "✅ Pairing completed" without running docker (status persists across menu redraws and restarts).
+# Use docker exec -i (no -t) so we get plain output when run from script; openclaw-guard/openclaw-worker use -it and can fail without a TTY.
+PAIRING_STATUS_FILE="${OPENCLAW_STATE_DIR:-/var/lib/openclaw/chloe/state}/.pairing_completed"
+update_pairing_status(){
+  if ! container_running "$guard_name" || ! container_running "$worker_name"; then
+    unset PAIRING_COMPLETED
+    rm -f "$PAIRING_STATUS_FILE" 2>/dev/null || true
+    return 1
+  fi
+  local guard_actual worker_actual guard_out worker_out
+  guard_actual=$(resolve_container_name "$guard_name" 2>/dev/null) || guard_actual="$guard_name"
+  worker_actual=$(resolve_container_name "$worker_name" 2>/dev/null) || worker_actual="$worker_name"
+  guard_out=$(docker exec -i "$guard_actual" ./openclaw.mjs devices list 2>/dev/null || true)
+  worker_out=$(docker exec -i "$worker_actual" ./openclaw.mjs devices list 2>/dev/null || true)
+  if pairing_done_for_output "$guard_out" && pairing_done_for_output "$worker_out"; then
+    export PAIRING_COMPLETED=1
+    touch "$PAIRING_STATUS_FILE" 2>/dev/null || true
+    return 0
+  fi
+  unset PAIRING_COMPLETED
+  rm -f "$PAIRING_STATUS_FILE" 2>/dev/null || true
+  return 1
+}
+
+# Extract pending pairing request IDs from "devices list" output (first UUID per line in Pending table).
+# Use Python so we don't depend on grep exit codes or awk behaviour across systems.
+pending_request_ids(){
+  local out="$1"
+  python3 - "$out" <<'PY'
+import re, sys
+text = sys.argv[1] if len(sys.argv) > 1 else ""
+uuid_re = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+pending = False
+for line in text.splitlines():
+    if re.search(r'[Pp]ending', line):
+        pending = True
+        continue
+    if re.search(r'[Pp]aired', line):
+        pending = False
+        continue
+    if pending:
+        m = uuid_re.search(line)
+        if m:
+            print(m.group(0))
+PY
+}
+
+# Extract paired count from "devices list" output (Paired (N) line).
+paired_count(){
+  local out="$1"
+  python3 - "$out" <<'PY'
+import re, sys
+text = sys.argv[1] if len(sys.argv) > 1 else ""
+m = re.search(r'[Pp]aired\s*\(\s*(\d+)\s*\)', text)
+print(m.group(1) if m else "0")
+PY
+}
+
+step_auth_tokens(){
+  local rot=""
+  local _origins_applied=false
+  while true; do
+    update_pairing_status || true
+    say "Configure Dashboards"
+    say "Dashboard URLs, CLI, and pending pairing requests."
+    # Ensure each CLI talks to its own gateway (guard→18790, worker→18789); fixes "device token mismatch" / wrong port
+    "$STACK_DIR/openclaw-guard" config set gateway.port 18790 >/dev/null 2>&1 || true
+    "$STACK_DIR/openclaw-worker" config set gateway.port 18789 >/dev/null 2>&1 || true
+    echo "  Docs: https://docs.openclaw.ai/web"
+    echo
+    # Tokens for dashboard auth (paste into Control UI settings if prompted)
+    worker_token=""
+    guard_token=""
+    if [ -f "$ENV_FILE" ]; then
+      worker_token=$(grep -E '^OPENCLAW_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+      guard_token=$(grep -E '^OPENCLAW_GUARD_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+    fi
+    if check_done tailscale; then
+      TSDNS=$(tailscale_dns)
+      TSDNS=${TSDNS:-unavailable}
+      ensure_control_ui_allowed_origins "$TSDNS"
+      if { container_running "$guard_name" || container_running "$worker_name"; } && [ "$_origins_applied" != "true" ]; then
+        cd "$STACK_DIR"
+        docker compose --env-file "$ENV_FILE" -f compose.yml restart openclaw-guard openclaw-gateway 2>/dev/null || true
+        _origins_applied=true
+      fi
+      echo "Dashboards (Tailscale HTTPS):"
+      if [ -n "$guard_token" ]; then
+        echo "  Guard:  https://${TSDNS}:444/#token=${guard_token}"
+      else
+        echo "  Guard:  https://${TSDNS}:444/  (no token in env — run step 3 or rotate)"
+      fi
+      if [ -n "$worker_token" ]; then
+        echo "  Worker: https://${TSDNS}/#token=${worker_token}"
+      else
+        echo "  Worker: https://${TSDNS}/  (no token in env — run step 3 or rotate)"
+      fi
+      echo "  Webtop: https://${TSDNS}:445/"
+    else
+      if grep -qE '^GATEWAY_HOST=0\.0\.0\.0' "$ENV_FILE" 2>/dev/null; then
+        local pub_ip
+        pub_ip=$(curl -s ifconfig.me || echo "YOUR_SERVER_IP")
+        echo "⚠️ Dashboards exposed to public internet (Tailscale skipped):"
+        [ -n "$guard_token" ] && echo "  Guard:  http://${pub_ip}:18790/#token=${guard_token}"
+        [ -n "$worker_token" ] && echo "  Worker: http://${pub_ip}:18789/#token=${worker_token}"
+        echo "  Webtop: http://${pub_ip}:6080/"
+      else
+        echo "Dashboards: not available yet — run option 6 (Tailscale setup) or access via SSH Tunnel."
+        [ -n "$guard_token" ] && echo "  Guard token:  $guard_token"
+        [ -n "$worker_token" ] && echo "  Worker token: $worker_token"
+      fi
+    fi
+    echo
+    # Fetch devices list for pairing status and pending (use resolved names for Compose-prefixed containers)
+    guard_devices=""
+    worker_devices=""
+    guard_actual=$(resolve_container_name "$guard_name" 2>/dev/null); guard_actual=${guard_actual:-$guard_name}
+    worker_actual=$(resolve_container_name "$worker_name" 2>/dev/null); worker_actual=${worker_actual:-$worker_name}
+    if container_running "$guard_name"; then
+      guard_devices=$(docker exec -i "$guard_actual" ./openclaw.mjs devices list 2>&1 || true)
+    fi
+    if container_running "$worker_name"; then
+      worker_devices=$(docker exec -i "$worker_actual" ./openclaw.mjs devices list 2>&1 || true)
+    fi
+    # DEBUG: set DEBUG_PAIRING=1 when running setup to capture raw devices list output for parsing inspection
+    if [ -n "${DEBUG_PAIRING-}" ]; then
+      printf '%s' "$guard_devices" > "$STACK_DIR/scripts/host/.debug-guard-devices.txt" 2>/dev/null || true
+      printf '%s' "$worker_devices" > "$STACK_DIR/scripts/host/.debug-worker-devices.txt" 2>/dev/null || true
+    fi
+    # Pairing status (paired count per instance). If CLI returns token mismatch, we can't read the list.
+    guard_paired=$(paired_count "$guard_devices")
+    worker_paired=$(paired_count "$worker_devices")
+    guard_token_err=0; worker_token_err=0
+    echo "$guard_devices" | grep -qi "token mismatch\|unauthorized.*device" && guard_token_err=1
+    echo "$worker_devices" | grep -qi "token mismatch\|unauthorized.*device" && worker_token_err=1
+    echo "Pairing status:"
+    if [ "${guard_paired:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  Guard:  ✅ $guard_paired paired"
+    elif [ "$guard_token_err" -eq 1 ]; then
+      echo "  Guard:  ⚠️ Token mismatch — rotate keys (option 1) to connect"
+    else
+      echo "  Guard:  ⚪ No devices paired yet"
+    fi
+    if [ "${worker_paired:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  Worker: ✅ $worker_paired paired"
+    elif [ "$worker_token_err" -eq 1 ]; then
+      echo "  Worker: ⚠️ Token mismatch — rotate keys (option 1) to connect"
+    else
+      echo "  Worker: ⚪ No devices paired yet"
+    fi
+    if [ "${guard_paired:-0}" -eq 0 ] 2>/dev/null || [ "${worker_paired:-0}" -eq 0 ] 2>/dev/null; then
+      echo
+      say "Let's set up your dashboards!"
+      say "First, open the Guard and Worker dashboards using the links above."
+      say "If you see Token mismatch, rotate the keys."
+      say "If you see disconnected (1008): pairing required — approve the pairing using the options below."
+      echo
+    fi
+    guard_pending=()
+    worker_pending=()
+    while IFS= read -r id; do [ -n "$id" ] && guard_pending+=("$id"); done < <(pending_request_ids "$guard_devices")
+    while IFS= read -r id; do [ -n "$id" ] && worker_pending+=("$id"); done < <(pending_request_ids "$worker_devices")
+    # Build menu: 1 = Rotate, 2 = Refresh, 3 = Approve all (if any pending), 4..N = Approve (one per pending), 0 = Return
+    options=("🔄 Rotate gateway tokens (only use this if you get token mismatch error)" "🔄 Refresh Pairing status")
+    option_type=("rotate" "refresh")
+    option_id=("" "")
+    if [ ${#guard_pending[@]} -gt 0 ] || [ ${#worker_pending[@]} -gt 0 ]; then
+      options+=("🤝 Approve all pending")
+      option_type+=("approve_all")
+      option_id+=("")
+    fi
+    for id in "${guard_pending[@]}"; do
+      short_id="${id:0:8}"
+      options+=("🤝 Approve pairing request for Guard — $short_id"); option_type+=("approve_guard"); option_id+=("$id")
+    done
+    for id in "${worker_pending[@]}"; do
+      short_id="${id:0:8}"
+      options+=("🤝 Approve pairing request for Worker — $short_id"); option_type+=("approve_worker"); option_id+=("$id")
+    done
+    num_opts=${#options[@]}
+    if [ ${#guard_pending[@]} -gt 0 ] || [ ${#worker_pending[@]} -gt 0 ]; then
+      echo "🤝 Pairing Request Detected!"
+      echo
+    fi
+    for i in "${!options[@]}"; do
+      printf "  %d. %s\n" $((i+1)) "${options[$i]}"
+    done
+    echo "  0. Return to main menu"
+    echo
+    read -r -p "$TIGER Choose [0-$num_opts]: " pick
+    pick=${pick:-0}
+    if [ "$pick" -eq 0 ] 2>/dev/null; then
+      break
+    fi
+    rot=""
+    if [ "$pick" -ge 1 ] 2>/dev/null && [ "$pick" -le "$num_opts" ] 2>/dev/null; then
+      idx=$((pick-1))
+      case "${option_type[$idx]}" in
+        rotate)
+          read -r -p "$TIGER Rotate gateway tokens? [y/N] " rot
+          case "$rot" in [yY]|[yY][eE][sS]*) rot=yes ;; *) rot="" ;; esac
+          ;;
+        refresh)
+          update_pairing_status || true
+          ok "Refreshing pairing status..."
+          ;;
+        approve_all)
+          approved=0
+          for id in "${guard_pending[@]}"; do
+            if docker exec -i "$guard_actual" ./openclaw.mjs devices approve "$id" 2>&1; then
+              ok "Approved Guard pairing $id"
+              ((approved++)) || true
+            else
+              warn "Approve failed for Guard $id"
+            fi
+          done
+          for id in "${worker_pending[@]}"; do
+            if docker exec -i "$worker_actual" ./openclaw.mjs devices approve "$id" 2>&1; then
+              ok "Approved Worker pairing $id"
+              ((approved++)) || true
+            else
+              warn "Approve failed for Worker $id"
+            fi
+          done
+          [ "$approved" -gt 0 ] && ok "Approved $approved pairing(s) total"
+          ;;
+        approve_guard)
+          docker exec -i "$guard_actual" ./openclaw.mjs devices approve "${option_id[$idx]}" 2>&1 && ok "Approved Guard pairing ${option_id[$idx]}" || warn "Approve failed (device list may have changed)"
+          ;;
+        approve_worker)
+          docker exec -i "$worker_actual" ./openclaw.mjs devices approve "${option_id[$idx]}" 2>&1 && ok "Approved Worker pairing ${option_id[$idx]}" || warn "Approve failed (device list may have changed)"
+          ;;
+      esac
+    fi
+    if [ -n "$rot" ]; then
+      if [ ! -f "$ENV_FILE" ]; then
+        warn "No env file at $ENV_FILE — run step 3 first."
+      else
+        sed -i "s#^OPENCLAW_GATEWAY_TOKEN=.*#OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)#" "$ENV_FILE"
+        sed -i "s#^OPENCLAW_GUARD_GATEWAY_TOKEN=.*#OPENCLAW_GUARD_GATEWAY_TOKEN=$(openssl rand -hex 24)#" "$ENV_FILE"
+        worker_token=$(grep -E '^OPENCLAW_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+        guard_token=$(grep -E '^OPENCLAW_GUARD_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+        sync_gateway_tokens_to_config "$worker_token" "$guard_token"
+        # Recreate (not just restart) so containers pick up new tokens from env file; restart keeps stale env
+        if (cd "$STACK_DIR" && docker compose --env-file "$ENV_FILE" -f compose.yml up -d --force-recreate openclaw-gateway openclaw-guard); then
+          ok "Tokens rotated and synced to config; guard and worker recreated. Updated URLs below."
+          echo
+          worker_token=$(grep -E '^OPENCLAW_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+          guard_token=$(grep -E '^OPENCLAW_GUARD_GATEWAY_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+          if check_done tailscale; then
+            TSDNS=$(tailscale_dns)
+            TSDNS=${TSDNS:-unavailable}
+            echo "Dashboards (Tailscale HTTPS):"
+            [ -n "$guard_token" ] && echo "  Guard:  https://${TSDNS}:444/#token=${guard_token}" || echo "  Guard:  https://${TSDNS}:444/  (no token in env)"
+            [ -n "$worker_token" ] && echo "  Worker: https://${TSDNS}/#token=${worker_token}" || echo "  Worker: https://${TSDNS}/  (no token in env)"
+            echo "  Webtop: https://${TSDNS}:445/"
+          else
+            [ -n "$guard_token" ] && echo "  Guard token:  $guard_token"
+            [ -n "$worker_token" ] && echo "  Worker token: $worker_token"
+          fi
+          echo
+        else
+          warn "Tokens updated in env and config, but container restart failed."
+        fi
+      fi
+    fi
+  done
+  update_pairing_status || true
+}
+
+step_help_useful_commands(){
+  say "Help and useful commands"
+  echo
+  echo "Roles:"
+  echo "  cat /var/lib/openclaw/guard/workspace/ROLE.md"
+  echo "  cat /var/lib/openclaw/chloe/workspace/ROLE.md"
+  echo "  Refresh after git pull or editing core/: sudo ./scripts/host/sync-workspaces.sh"
+  echo
+  echo "Devices:"
+  echo "  ./openclaw-guard devices list"
+  echo "  ./openclaw-guard devices approve <requestId>"
+  echo "  ./openclaw-worker devices list"
+  echo "  ./openclaw-worker devices approve <requestId>"
+  echo
+  echo "Exec approvals (when Op says 'exec approval id: ...'):"
+  echo "  ./openclaw-guard approvals get --json"
+  echo "  ./openclaw-guard approvals allowlist add \"<path or glob>\""
+  echo "  Approve pending: Control UI (Nodes → Exec approvals) or in chat: /approve <id> allow-once"
+  echo
+  echo "Pairing:"
+  echo "  ./openclaw-guard pairing approve telegram <CODE>"
+  echo "  ./openclaw-worker pairing approve telegram <CODE>"
+  echo
+  echo "Config / tokens:"
+  echo "  ./openclaw-guard config get gateway.auth.token"
+  echo "  ./openclaw-guard config get channels.telegram.capabilities.inlineButtons"
+  echo "  ./openclaw-guard doctor --generate-gateway-token"
+  echo "  ./openclaw-worker config get gateway.auth.token"
+  echo "  ./openclaw-worker doctor --generate-gateway-token"
+  echo
+  echo "Run OpenClaw CLI:"
+  echo "  ./openclaw-guard"
+  echo "  ./openclaw-worker"
+}
+
+run_step(){
+  local n="$1"
+  sep
+  case "$n" in
+    1) step_preflight ;;
+    2) step_volume_root ;;
+    3) step_docker ;;
+    4) step_env ;;
+    5) step_browser_init ;;
+    6) step_bitwarden_secrets ;;
+    7) step_tailscale ;;
+    8) ensure_repo_writable_for_guard; sync_core_workspaces; step_start_guard; ensure_guard_approval_instructions ;;
+    9) sync_core_workspaces; step_start_worker ;;
+    10) step_start_browser; ensure_browser_profile; ensure_inline_buttons ;;
+    11) step_auth_tokens ;;
+    12) sync_core_workspaces; step_configure_guard ;;
+    13) sync_core_workspaces; step_configure_worker ;;
+    14) step_seed_instructions ;;
+    15) step_guard_admin_mode ;;
+    16) step_verify ;;
+    17) step_help_useful_commands ;;
+    18) step_restart_all ;;
+    *) warn "Unknown step" ;;
+  esac
+  fix_repo_ownership
+  echo
+  read -r -p "$TIGER Press Enter to return to menu..." _
+}
+
+menu_once(){
+  welcome
+  printf "$TIGER Checking status..."
+  echo
+  echo
+  echo "Follow these steps one by one:"
+  echo
+  printf "  %2d. %-24s | %s\n"  1 "preflight"           "$(step_status 1)"
+  printf "  %2d. %-24s | %s\n"  2 "data location (volume)" "$(step_status 2)"
+  printf "  %2d. %-24s | %s\n"  3 "docker"              "$(step_status 3)"
+  printf "  %2d. %-24s | %s\n"  4 "environment"        "$(step_status 4)"
+  printf "  %2d. %-24s | %s\n"  5 "browser init"       "$(step_status 5)"
+  printf "  %2d. %-24s | %s\n"  6 "bitwarden"          "$(step_status 6)"
+  printf "  %2d. %-24s | %s\n"  7 "tailscale"          "$(step_status 7)"
+  printf "  %2d. %-24s | %s\n"  8 "start guard"        "$(step_status 8)"
+  printf "  %2d. %-24s | %s\n"  9 "start worker"       "$(step_status 9)"
+  printf "  %2d. %-24s | %s\n" 10 "start browser"      "$(step_status 10)"
+  printf "  %2d. %-24s | %s\n" 11 "configure Dashboards" "$(step_status 11)"
+  printf "  %2d. %-24s | %s\n" 12 "configure guard"    "$(step_status 12)"
+  printf "  %2d. %-24s | %s\n" 13 "configure worker"   "$(step_status 13)"
+  printf "  %2d. %-24s | %s\n" 14 "seed instructions" "$(step_status 14)"
+  printf "  %2d. %-24s | %s\n" 15 "guard admin mode"   "$(step_status 15)"
+  printf "  %2d. %-24s | %s\n" 16 "healthcheck"        "$(step_status 16)"
+  printf "  %2d. %-24s | %s\n" 17 "help / useful cmds" "$(step_status 17)"
+  printf "  %2d. %-24s | %s\n" 18 "restart all services" "$(step_status 18)"
+  echo
+  if check_done tailscale; then
+    menu_tsdns=$(tailscale_dns)
+    if [ -n "$menu_tsdns" ]; then
+      echo "Dashboards:"
+      echo "  🐕 Guard:  https://${menu_tsdns}:444/"
+      echo "  🐯 Worker: https://${menu_tsdns}/"
+      echo "  🖥️  Webtop: https://${menu_tsdns}:445/"
+      echo
+    fi
+  fi
+  read -r -p "$TIGER Select step [1-18] or 0 to exit: " pick
+  case "$pick" in
+    0) say "Exiting setup wizard. See you soon."; return 1 ;;
+    1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18) run_step "$pick" ;;
+    *) warn "Invalid choice" ;;
+  esac
+  return 0
+}
+
+need_root
+while menu_once; do :; done
