@@ -42,7 +42,7 @@ services:
       - ${OPENCLAW_STACK_DIR:-/opt/op-and-chloe}:/opt/op-and-chloe:ro
     init: true
     restart: unless-stopped
-    command: ["node","dist/index.js","gateway","--bind","loopback","--port","18789","--allow-unconfigured"]
+    command: ["node","dist/index.js","gateway","--bind","all","--port","18789","--allow-unconfigured"]
 
   openclaw-guard:
     image: ${OPENCLAW_GUARD_IMAGE:-openclaw-guard-tools:local}
@@ -71,7 +71,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     init: true
     restart: unless-stopped
-    command: ["node", "dist/index.js", "gateway", "--bind", "loopback", "--port", "18790", "--allow-unconfigured"]
+    command: ["node", "dist/index.js", "gateway", "--bind", "all", "--port", "18790", "--allow-unconfigured"]
 
 networks:
   openclaw_net:
