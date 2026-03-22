@@ -840,6 +840,33 @@ step_browser_init(){
   ok "CDP watchdog timer installed and enabled"
 }
 
+enable_control_ui_host_fallback(){
+  local worker_state guard_state
+  if [ -f "$ENV_FILE" ]; then
+    worker_state=$(grep -E '^OPENCLAW_STATE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+    guard_state=$(grep -E '^OPENCLAW_GUARD_STATE_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+  fi
+  worker_state="${worker_state:-/var/lib/openclaw/chloe/state}"
+  guard_state="${guard_state:-/var/lib/openclaw/guard/state}"
+  WORKER_CFG="${worker_state}/openclaw.json" GUARD_CFG="${guard_state}/openclaw.json" python3 - <<'PY2'
+import json, pathlib, os
+worker_cfg = pathlib.Path(os.environ.get("WORKER_CFG", "/var/lib/openclaw/chloe/state/openclaw.json"))
+guard_cfg = pathlib.Path(os.environ.get("GUARD_CFG", "/var/lib/openclaw/guard/state/openclaw.json"))
+for cfg in [worker_cfg, guard_cfg]:
+    d = {}
+    if cfg.exists() and cfg.stat().st_size > 0:
+        try: d = json.loads(cfg.read_text())
+        except json.JSONDecodeError: pass
+    else:
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+    g = d.setdefault("gateway", {})
+    cu = g.setdefault("controlUi", {})
+    cu["dangerouslyAllowHostHeaderOriginFallback"] = True
+    cfg.write_text(json.dumps(d, indent=2) + "\n")
+PY2
+  chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
+}
+
 step_tailscale(){
   say "Step 7: Network Access Setup"
   say "Exposing dashboards to the public internet (0.0.0.0) instead of using Tailscale..."
@@ -847,6 +874,8 @@ step_tailscale(){
   sed -i "s/^GUARD_GATEWAY_HOST=.*/GUARD_GATEWAY_HOST=0.0.0.0/" "$ENV_FILE" 2>/dev/null || true
   sed -i "s/^NOVNC_HOST=.*/NOVNC_HOST=0.0.0.0/" "$ENV_FILE" 2>/dev/null || true
   
+  enable_control_ui_host_fallback
+
   if { container_running "$guard_name" || container_running "$worker_name"; }; then
     say "Restarting containers to apply bindings..."
     cd "$STACK_DIR"
