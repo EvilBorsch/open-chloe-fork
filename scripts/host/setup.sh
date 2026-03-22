@@ -1111,7 +1111,7 @@ step_auth_tokens(){
     else
       if grep -qE '^GATEWAY_HOST=0\.0\.0\.0' "$ENV_FILE" 2>/dev/null; then
         local pub_ip
-        pub_ip=$(curl -s ifconfig.me || echo "YOUR_SERVER_IP")
+        pub_ip=$(curl -s -4 ifconfig.me || echo "YOUR_SERVER_IP")
         echo "⚠️ Dashboards exposed to public internet (Tailscale skipped):"
         [ -n "$guard_token" ] && echo "  Guard:  http://${pub_ip}:18790/#token=${guard_token}"
         [ -n "$worker_token" ] && echo "  Worker: http://${pub_ip}:18789/#token=${worker_token}"
@@ -1267,8 +1267,17 @@ step_auth_tokens(){
             [ -n "$worker_token" ] && echo "  Worker: https://${TSDNS}/#token=${worker_token}" || echo "  Worker: https://${TSDNS}/  (no token in env)"
             echo "  Webtop: https://${TSDNS}:445/"
           else
-            [ -n "$guard_token" ] && echo "  Guard token:  $guard_token"
-            [ -n "$worker_token" ] && echo "  Worker token: $worker_token"
+            if grep -qE '^GATEWAY_HOST=0\.0\.0\.0' "$ENV_FILE" 2>/dev/null; then
+              local pub_ip
+              pub_ip=$(curl -s -4 ifconfig.me || echo "YOUR_SERVER_IP")
+              echo "⚠️ Dashboards exposed to public internet (Tailscale skipped):"
+              [ -n "$guard_token" ] && echo "  Guard:  http://${pub_ip}:18790/#token=${guard_token}" || echo "  Guard:  http://${pub_ip}:18790/  (no token in env)"
+              [ -n "$worker_token" ] && echo "  Worker: http://${pub_ip}:18789/#token=${worker_token}" || echo "  Worker: http://${pub_ip}:18789/  (no token in env)"
+              echo "  Webtop: http://${pub_ip}:6080/"
+            else
+              [ -n "$guard_token" ] && echo "  Guard token:  $guard_token"
+              [ -n "$worker_token" ] && echo "  Worker token: $worker_token"
+            fi
           fi
           echo
         else
