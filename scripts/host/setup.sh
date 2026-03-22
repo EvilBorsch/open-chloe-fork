@@ -657,7 +657,7 @@ ensure_stack_repo_alias(){
 check_done(){
   local id="$1"
   case "$id" in
-    docker) command -v docker >/dev/null 2>&1 ;;
+    docker) command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 ;;
     env) [ -f "$ENV_FILE" ] ;;
     browser_init) [ -f /var/lib/openclaw/browser/custom-cont-init.d/20-start-chromium-cdp ] && [ -f /var/lib/openclaw/browser/custom-cont-init.d/30-start-socat-cdp-proxy ] ;;
     running) container_running "$worker_name" && container_running "$guard_name" ;;
