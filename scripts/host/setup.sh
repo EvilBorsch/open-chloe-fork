@@ -862,6 +862,8 @@ for cfg in [worker_cfg, guard_cfg]:
     g = d.setdefault("gateway", {})
     cu = g.setdefault("controlUi", {})
     cu["dangerouslyAllowHostHeaderOriginFallback"] = True
+    cu["allowInsecureAuth"] = True
+    cu["dangerouslyDisableDeviceAuth"] = True
     cfg.write_text(json.dumps(d, indent=2) + "\n")
 PY2
   chown 1000:1000 /var/lib/openclaw/chloe/state/openclaw.json /var/lib/openclaw/guard/state/openclaw.json 2>/dev/null || true
